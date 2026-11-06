@@ -1,0 +1,23 @@
+services:
+  camera-watcher:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    env_file:
+      - .env
+    environment:
+      CAPTURE_DIR: /app/captures
+      YOLO_MODEL: /app/models/yolo26n.pt
+      YOLO_CONFIG_DIR: /app/models/.ultralytics
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    volumes:
+      - ./captures:/app/captures
+      - yolo-model-cache:/app/models
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+volumes:
+  yolo-model-cache:
