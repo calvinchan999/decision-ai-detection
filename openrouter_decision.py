@@ -21,7 +21,7 @@ class OpenRouterDecisionAnalyzer:
     def analyze_frame(self, image: bytes, person_present: bool) -> DetectionScores:
         image_data = base64.b64encode(image).decode("ascii")
         questions = build_questions(person_present)
-        if person_present:
+        if person_present and "drinking" in questions:
             questions["drinking"]["criteria"] = {
                 "true": "A person appears to be drinking or taking a sip.",
                 "false": "No plausible visual cues of drinking are present.",

@@ -1,20 +1,36 @@
-# RTSP beverage drinking detection
+# RTSP drinking and faucet detection
 
 This program samples the RTSP camera at 2 frames per second. YOLO26n checks
 processed frames for a person. Only when a person is detected does the selected
 AI provider check for possible drinking and for a person actively using a
-running faucet or tap. Drinking includes any beverage. The tap decision requires
+running faucet or tap. Drinking includes any beverage. The faucet decision requires
 visible water flow and interaction with the same tap or its water; a person
 merely nearby or an unattended running tap does not qualify. A still image
 cannot reliably establish the exact moment someone turned a tap on. An open or
 boiling kettle alone does not qualify.
 
-Each decision has an independent yes-probability; scores strictly greater
-than **0.5** trigger an upload. Drinking images go to `drinking/` and tap-use
-images to the existing `boilwater/` prefix inside the configured Azure container.
+In the default `choice` mode the provider answers one exclusive question and
+returns a probability for each of `drinking`, `faucet`, and `other`. A probability
+strictly greater than **0.5** triggers an upload; because the three options form a
+single distribution, at most one of them can clear that bar, so one frame never
+lands in both folders. With `QUESTION_MODE=binary` the two questions are
+independent and a frame may be uploaded to both paths. Note that 0.5 is a stricter
+gate in `choice` mode than on two independent questions: when `drinking` and
+`faucet` both sit near 0.45, `other` wins and nothing is uploaded.
+Drinking images go to `drinking/` and faucet images to `faucet/` inside the
+configured Azure container. The folder for each
+category is mapped in `CATEGORY_PREFIXES` in `azure_blob.py`; the faucet
+detector was earlier called `boilwater`, so set that value there if the container
+folder has to stay continuous with the older data set.
 If both are positive, the same JPEG goes to both paths. The local image is deleted only
 after all required uploads succeed; otherwise it remains in `captures` and
 the error is logged. Failed uploads are not retried automatically.
+
+Because frames are sampled continuously, one event produces several positive
+frames: at the default one request per second, a three-second drink yields about
+three uploads. That repetition comes from sampling, not from asking two
+questions, so it is controlled by `UPLOAD_COOLDOWN_SECONDS` rather than by the
+number of questions.
 
 The camera loop uses the provider-neutral `FrameAnalyzer` interface in
 `ai_analyzer.py`. Select `cloudflare` or `openrouter` with `AI_PROVIDER`; the
@@ -39,12 +55,17 @@ exceed provider image size limits.
 
 ## Configure and run
 
-Replace the placeholders in `.env`. The runner loads it from the same directory
-as the script. Values set in the process environment take precedence over
+Copy `.env.sample` to `.env` and replace the placeholders. The runner loads it
+from the same directory as the script. Values set in the process environment take precedence over
 `.env`. Keep `.env` private; it is excluded from Git.
 
 - `CAMERA_RTSP_URL`: full camera RTSP URL
 - `AI_PROVIDER`: `cloudflare` (default) or `openrouter`
+- `QUESTION_MODE`: `choice` (default) or `binary`. `choice` asks one exclusive
+  question with three options (`drinking`, `faucet`, `other`) and the answer
+  carries a probability per option that sums to one, so one frame can never be
+  uploaded to both folders. `binary` asks two independent yes/no questions and
+  keeps the older behaviour, including the case where both pass the threshold
 - `AI_IMAGE_MAX_WIDTH`, `AI_IMAGE_MAX_HEIGHT`: positive integer maximum
   dimensions in pixels for images sent to either AI provider; default to `1280`
   and `720`. For example, set them to `640` and `360` for a 360p limit.
@@ -57,10 +78,18 @@ as the script. Values set in the process environment take precedence over
   `https://account.blob.core.windows.net/tmp-image`
 - `AZURE_BLOB_SAS_TOKEN`: SAS query string with create or write permission;
   keep it private and omit the leading `?`
-- `YOLO_PERSON_CONFIDENCE`: person-detection threshold; defaults to `0.20`
+- `YOLO_PERSON_CONFIDENCE`: person-detection threshold; defaults to `0.25`
 - `YOLO_IMAGE_SIZE`: YOLO inference size, a multiple of 32; defaults to `960`
 - `YOLO_MODEL`: model path; defaults to `yolo26n.pt`
 - `YOLO_DEVICE`: inference device; defaults to `cpu`
+- `CAPTURE_FPS`: frames pulled from FFmpeg per second; defaults to `2`. Every
+  frame goes through the YOLO person gate
+- `AI_REQUEST_INTERVAL_SECONDS`: minimum seconds between AI requests once a person
+  is present; defaults to `2`. Lower it to analyse more frames, at higher cost
+- `UPLOAD_COOLDOWN_SECONDS` (optional): after a category has been uploaded,
+  further uploads for that same category are suppressed for this many seconds;
+  defaults to `0`, which uploads every positive frame. The two categories are
+  tracked independently, so a cooldown on `drinking` does not block `faucet`
 - `CAPTURE_DIR` (optional): output directory; defaults to `captures` beside the
   script
 - `FFMPEG_PATH` (optional): FFmpeg executable path if it is not on `PATH`
@@ -78,7 +107,8 @@ under AGPL-3.0; review its terms for your deployment.
 
 ## Run with Docker Compose
 
-Replace the placeholders in `.env`, then start the container:
+Copy `.env.sample` to `.env`, replace the placeholders, then start the
+container:
 
 ```powershell
 New-Item -ItemType Directory -Force .\captures | Out-Null
@@ -93,9 +123,14 @@ Stop the service with `docker compose down`. On Linux, if the container cannot
 write to the captures folder, set `APP_UID` and `APP_GID` in `.env` to the host
 user's numeric IDs and rebuild.
 
-The camera is continuously decoded by FFmpeg and sampled at 2 fps without a
-software resolution cap; JPEG quality is set to FFmpeg q:v 2. The latest frame
-is resized for the AI provider with requests spaced at least one second apart.
+The camera is continuously decoded by FFmpeg and sampled at `CAPTURE_FPS` frames
+per second (2 by default) without a software resolution cap; JPEG quality is set
+to FFmpeg q:v 2. The latest frame is resized for the AI provider with requests
+spaced at least `AI_REQUEST_INTERVAL_SECONDS` apart (2 seconds by default). With
+2 fps sampling and a 2 second interval, only the newest frame is taken per
+interval: while a person is in view the other three frames are discarded before
+the YOLO gate runs, so a one-second sip can fall entirely between two analysed
+frames and never be seen at all.
 Both questions share one request when a person is detected; if YOLO finds no
 person or fails, the frame is not sent to the AI. YOLO misses can therefore
 cause both kinds of events to be missed. Frames waiting while

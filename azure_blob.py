@@ -9,6 +9,15 @@ class AzureUploadError(Exception):
     pass
 
 
+# Blob folder used for each detection category. The faucet detector was
+# historically called "boilwater"; set that value here only if the container
+# folder has to stay continuous with the older data set.
+CATEGORY_PREFIXES = {
+    "drinking": "drinking",
+    "faucet": "faucet",
+}
+
+
 class AzureBlobUploader:
     def __init__(self) -> None:
         container_url = os.environ.get("AZURE_BLOB_CONTAINER_URL", "").strip()
@@ -41,7 +50,7 @@ class AzureBlobUploader:
         self.sas_token = sas_token
 
     def upload(self, image_path: Path, category: str) -> None:
-        if category not in ("drinking", "boilwater"):
+        if category not in CATEGORY_PREFIXES:
             raise AzureUploadError(f"Unknown detection category: {category}")
         try:
             image = image_path.read_bytes()
@@ -49,8 +58,8 @@ class AzureBlobUploader:
             raise AzureUploadError(f"Could not read captured image: {error}") from None
 
         blob_url = (
-            f"{self.container_url}/{category}/{quote(image_path.name, safe='')}?"
-            f"{self.sas_token}"
+            f"{self.container_url}/{CATEGORY_PREFIXES[category]}/"
+            f"{quote(image_path.name, safe='')}?{self.sas_token}"
         )
         request = Request(
             blob_url,

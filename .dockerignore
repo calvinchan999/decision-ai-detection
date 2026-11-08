@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.sample
 .git
 __pycache__/
 *.py[cod]

@@ -1,3 +1,4 @@
+import math
 import os
 import queue
 import re
@@ -10,6 +11,7 @@ import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Optional
 
 from PIL import Image
 
@@ -18,10 +20,13 @@ from azure_blob import AzureBlobUploader, AzureUploadError
 from person_filter import PersonFilter, PersonFilterError
 
 
-FRAME_INTERVAL_SECONDS = 1
-CAPTURE_FPS = 2
 POSITIVE_THRESHOLD = 0.5
 DEFAULT_AI_IMAGE_MAX_SIZE = (1280, 720)
+UPLOAD_COOLDOWN_ENV = "UPLOAD_COOLDOWN_SECONDS"
+CAPTURE_FPS_ENV = "CAPTURE_FPS"
+AI_REQUEST_INTERVAL_ENV = "AI_REQUEST_INTERVAL_SECONDS"
+DEFAULT_CAPTURE_FPS = 2
+DEFAULT_AI_REQUEST_INTERVAL_SECONDS = 2.0
 stop_event = threading.Event()
 
 
@@ -67,6 +72,47 @@ def get_ai_image_max_size() -> tuple[int, int]:
             raise ValueError(f"{name} must be a positive integer.")
         dimensions.append(value)
     return dimensions[0], dimensions[1]
+
+
+def get_capture_fps() -> int:
+    raw = os.environ.get(CAPTURE_FPS_ENV, str(DEFAULT_CAPTURE_FPS)).strip()
+    try:
+        fps = int(raw or DEFAULT_CAPTURE_FPS)
+    except ValueError:
+        raise ValueError(f"{CAPTURE_FPS_ENV} must be a positive integer.") from None
+    if fps <= 0:
+        raise ValueError(f"{CAPTURE_FPS_ENV} must be a positive integer.")
+    return fps
+
+
+def get_ai_request_interval() -> float:
+    raw = os.environ.get(
+        AI_REQUEST_INTERVAL_ENV, str(DEFAULT_AI_REQUEST_INTERVAL_SECONDS)
+    ).strip()
+    try:
+        seconds = float(raw or DEFAULT_AI_REQUEST_INTERVAL_SECONDS)
+    except ValueError:
+        raise ValueError(
+            f"{AI_REQUEST_INTERVAL_ENV} must be a positive number of seconds."
+        ) from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(
+            f"{AI_REQUEST_INTERVAL_ENV} must be a positive number of seconds."
+        )
+    return seconds
+
+
+def get_upload_cooldown() -> float:
+    raw = os.environ.get(UPLOAD_COOLDOWN_ENV, "0").strip() or "0"
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise ValueError(f"{UPLOAD_COOLDOWN_ENV} must be a number of seconds.") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(
+            f"{UPLOAD_COOLDOWN_ENV} must be a non-negative number of seconds."
+        )
+    return seconds
 
 
 def iter_jpeg_frames(stream):
@@ -148,17 +194,36 @@ def handle_detections(
     scores: DetectionScores,
     capture_dir: Path,
     uploader: AzureBlobUploader,
+    cooldown: float = 0.0,
+    last_upload_at: Optional[dict[str, float]] = None,
 ) -> None:
     if scores.drinking is not None:
         print(f"Drinking score: {scores.drinking:.3f}", flush=True)
-    print(f"Tap-use score: {scores.boilwater:.3f}", flush=True)
+    print(f"Faucet score: {scores.faucet:.3f}", flush=True)
     categories = []
     if scores.drinking is not None and scores.drinking > POSITIVE_THRESHOLD:
         categories.append("drinking")
-    if scores.boilwater > POSITIVE_THRESHOLD:
-        categories.append("boilwater")
+    if scores.faucet > POSITIVE_THRESHOLD:
+        categories.append("faucet")
     if not categories:
         return
+
+    if cooldown > 0 and last_upload_at is not None:
+        now = time.monotonic()
+        suppressed = [
+            category
+            for category in categories
+            if now - last_upload_at.get(category, now - cooldown) < cooldown
+        ]
+        categories = [c for c in categories if c not in suppressed]
+        if suppressed:
+            print(
+                f"Cooldown suppressed {', '.join(suppressed)} "
+                f"({cooldown:g}s without a new upload).",
+                flush=True,
+            )
+        if not categories:
+            return
 
     try:
         image_path = save_image(image, capture_dir)
@@ -180,6 +245,10 @@ def handle_detections(
             f"{', '.join(categories)} and deleted the local copy.",
             flush=True,
         )
+        if last_upload_at is not None:
+            uploaded_at = time.monotonic()
+            for category in categories:
+                last_upload_at[category] = uploaded_at
 
 
 def run() -> int:
@@ -193,6 +262,19 @@ def run() -> int:
         ai_image_max_size = get_ai_image_max_size()
     except ValueError as error:
         print(f"Invalid AI image configuration: {error}", file=sys.stderr)
+        return 2
+
+    try:
+        upload_cooldown = get_upload_cooldown()
+    except ValueError as error:
+        print(f"Invalid upload cooldown: {error}", file=sys.stderr)
+        return 2
+
+    try:
+        capture_fps = get_capture_fps()
+        ai_request_interval = get_ai_request_interval()
+    except ValueError as error:
+        print(f"Invalid capture configuration: {error}", file=sys.stderr)
         return 2
 
     camera_url = os.environ.get("CAMERA_RTSP_URL", "").strip()
@@ -238,14 +320,21 @@ def run() -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     print(
-        f"Frames sampled at {CAPTURE_FPS} fps; YOLO gates drinking and "
-        f"tap-use detection. AI image maximum is {ai_image_max_size[0]}x"
+        f"Frames sampled at {capture_fps} fps; YOLO gates drinking and "
+        f"faucet detection. AI image maximum is {ai_image_max_size[0]}x"
         f"{ai_image_max_size[1]}. Hosted AI requests "
-        f"are spaced at least {FRAME_INTERVAL_SECONDS} second apart. "
-        "Press Ctrl+C to stop.",
+        f"are spaced at least {ai_request_interval:g} seconds apart. "
+        + (
+            f"Repeat uploads per category are suppressed for "
+            f"{upload_cooldown:g} seconds. "
+            if upload_cooldown > 0
+            else "Every positive frame is uploaded. "
+        )
+        + "Press Ctrl+C to stop.",
         flush=True,
     )
 
+    upload_state: dict[str, float] = {}
     next_request_at = 0.0
     while not stop_event.is_set():
         command = [
@@ -260,7 +349,7 @@ def run() -> int:
             camera_url,
             "-an",
             "-vf",
-            f"fps={CAPTURE_FPS}/1",
+            f"fps={capture_fps}/1",
             "-q:v",
             "2",
             "-f",
@@ -319,7 +408,7 @@ def run() -> int:
             if not person_present:
                 continue
 
-            next_request_at = time.monotonic() + FRAME_INTERVAL_SECONDS
+            next_request_at = time.monotonic() + ai_request_interval
             try:
                 scores = analyze_captured_frame(
                     analyzer, image, person_present, ai_image_max_size
@@ -327,7 +416,14 @@ def run() -> int:
             except AnalyzerError as error:
                 print(f"Frame analysis failed: {error}", file=sys.stderr, flush=True)
             else:
-                handle_detections(image, scores, capture_dir, azure_uploader)
+                handle_detections(
+                    image,
+                    scores,
+                    capture_dir,
+                    azure_uploader,
+                    upload_cooldown,
+                    upload_state,
+                )
 
         if stop_event.is_set() and process.poll() is None:
             process.terminate()
