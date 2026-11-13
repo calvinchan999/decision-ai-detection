@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
         torch torchvision \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=${APP_UID}:${APP_GID} ai_analyzer.py azure_blob.py cloudflare_clef.py openrouter_decision.py person_filter.py stream_camera.py ./
+COPY --chown=${APP_UID}:${APP_GID} ai_analyzer.py azure_blob.py cloudflare_clef.py openrouter_decision.py llama_cpp_decision.py person_filter.py stream_camera.py ./
 
 RUN mkdir -p /app/captures /app/models/.ultralytics \
     && chown -R "${APP_UID}:${APP_GID}" /app

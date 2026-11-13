@@ -58,7 +58,7 @@ class DetectionTests(unittest.TestCase):
             ((1920, 1080), (1920, 1080), (1920, 1080)),
             ((640, 480), (1920, 1080), (640, 480)),
         ]
-        with patch.dict(os.environ, env), tempfile.TemporaryDirectory() as directory:
+        with patch.dict(os.environ, env, clear=True), tempfile.TemporaryDirectory() as directory:
             providers = [
                 (cloudflare_clef, cloudflare_clef.CloudflareClefAnalyzer(), True),
                 (openrouter_decision, openrouter_decision.OpenRouterDecisionAnalyzer(), False),
@@ -72,6 +72,7 @@ class DetectionTests(unittest.TestCase):
                         result = {"answers": {
                             "faucet": {"type": "noul", "noul": 0.9},
                             "drinking": {"type": "noul", "noul": 0.1},
+                            "microwave": {"type": "noul", "noul": 0.1},
                         }}
                         if wrapped:
                             result = {"success": True, "result": result}
@@ -130,7 +131,7 @@ class DetectionTests(unittest.TestCase):
             "OPENROUTER_API_KEY": "key",
             "QUESTION_MODE": "binary",
         }
-        with patch.dict(os.environ, env):
+        with patch.dict(os.environ, env, clear=True):
             providers = [
                 (cloudflare_clef, cloudflare_clef.CloudflareClefAnalyzer(), True),
                 (openrouter_decision, openrouter_decision.OpenRouterDecisionAnalyzer(), False),
@@ -147,6 +148,7 @@ class DetectionTests(unittest.TestCase):
                         answers = {
                             "faucet": {"type": "noul", "noul": 0.8},
                             "drinking": {"type": "noul", "noul": 0.7},
+                            "microwave": {"type": "noul", "noul": 0.9},
                         }
                         result = {"answers": answers}
                         if wrapped:
@@ -155,6 +157,7 @@ class DetectionTests(unittest.TestCase):
                             scores = analyzer.analyze_frame(b"jpeg", person)
                         self.assertEqual(scores.faucet, 0.8)
                         self.assertEqual(scores.drinking, 0.7)
+                        self.assertEqual(scores.microwave, 0.9)
                         request = json.loads(send.call_args.args[0].data)
                         image_data = base64.b64encode(b"jpeg").decode("ascii")
                         if wrapped:
@@ -166,7 +169,7 @@ class DetectionTests(unittest.TestCase):
                             )
                         self.assertEqual(
                             set(request["questions"]),
-                            {"faucet", "drinking"},
+                            {"faucet", "drinking", "microwave"},
                         )
                         faucet_prompt = request["questions"]["faucet"]["instructions"]
                         self.assertEqual(faucet_prompt, ai_analyzer.FAUCET_INSTRUCTIONS)
@@ -177,6 +180,10 @@ class DetectionTests(unittest.TestCase):
                         self.assertEqual(
                             request["questions"]["drinking"]["instructions"],
                             ai_analyzer.DRINKING_INSTRUCTIONS,
+                        )
+                        self.assertEqual(
+                            request["questions"]["microwave"]["instructions"],
+                            ai_analyzer.MICROWAVE_INSTRUCTIONS,
                         )
 
     def test_capture_loop_only_analyzes_when_yolo_detects_person(self):
@@ -196,7 +203,7 @@ class DetectionTests(unittest.TestCase):
                 frames.get_nowait.side_effect = stream_camera.queue.Empty
                 analyzer = MagicMock()
                 uploader = MagicMock()
-                scores = ai_analyzer.DetectionScores(0.7, 0.8)
+                scores = ai_analyzer.DetectionScores(0.7, 0.8, 0.1)
                 with patch.dict(os.environ, {
                          "CAMERA_RTSP_URL": "rtsp://example",
                          "AI_IMAGE_MAX_WIDTH": "640",
@@ -236,6 +243,59 @@ class DetectionTests(unittest.TestCase):
             ai_analyzer.parse_scores(
                 {"faucet": {"type": "noul", "noul": 0.9}}, True, "Provider"
             )
+        with self.assertRaisesRegex(ai_analyzer.AnalyzerError, "microwave"):
+            ai_analyzer.parse_scores(
+                {
+                    "faucet": {"type": "noul", "noul": 0.9},
+                    "drinking": {"type": "noul", "noul": 0.1},
+                },
+                True,
+                "Provider",
+            )
+
+    def test_provider_selection_and_shared_model(self):
+        env = {
+            "CLOUDFLARE_ACCOUNT_ID": "account",
+            "CLOUDFLARE_API_TOKEN": "token",
+            "OPENROUTER_API_KEY": "key",
+            "QUESTION_MODE": "binary",
+        }
+        cases = [
+            ("cloudflare", "clef", cloudflare_clef, True),
+            ("cloudflare", "clef-flash", cloudflare_clef, True),
+            ("openrouter", "liquid/d1.1", openrouter_decision, False),
+            ("openrouter", "example/decision-model", openrouter_decision, False),
+        ]
+        answers = {
+            "faucet": {"type": "noul", "noul": 0.8},
+            "drinking": {"type": "noul", "noul": 0.2},
+            "microwave": {"type": "noul", "noul": 0.1},
+        }
+        for provider, model, module, wrapped in cases:
+            with self.subTest(provider=provider, model=model):
+                settings = dict(env, AI_PROVIDER=provider, MODEL=model)
+                result = {"answers": answers}
+                if wrapped:
+                    result = {"success": True, "result": result}
+                with patch.dict(os.environ, settings, clear=True):
+                    analyzer = ai_analyzer.create_analyzer()
+                    with patch.object(module, "urlopen", return_value=Response(result)) as send:
+                        analyzer.analyze_frame(b"jpeg", True)
+                request = send.call_args.args[0]
+                self.assertEqual(json.loads(request.data)["model"], model)
+                if wrapped:
+                    self.assertTrue(request.full_url.endswith("/@cf/cloudflare/" + model))
+                else:
+                    self.assertEqual(request.full_url, "https://openrouter.ai/api/alpha/decisions")
+
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(cloudflare_clef.CloudflareClefAnalyzer().model, "clef")
+            self.assertEqual(openrouter_decision.OpenRouterDecisionAnalyzer().model, "liquid/d1.1")
+            for model in ("", "liquid/d1.1", "../clef"):
+                with self.subTest(invalid_cloudflare_model=model):
+                    with patch.dict(os.environ, {"MODEL": model}):
+                        with self.assertRaisesRegex(ai_analyzer.AnalyzerError, "MODEL"):
+                            cloudflare_clef.CloudflareClefAnalyzer()
 
     def test_upload_paths_and_delete_only_when_all_succeed(self):
         env = {
@@ -247,23 +307,24 @@ class DetectionTests(unittest.TestCase):
             image = Path(directory) / "frame.jpg"
             image.write_bytes(b"jpeg")
             with patch.object(azure_blob, "urlopen", return_value=Response()) as send:
-                uploader.upload_then_delete(image, ["drinking", "faucet"])
+                uploader.upload_then_delete(image, ["drinking", "faucet", "microwave"])
             urls = [call.args[0].full_url.split("?")[0] for call in send.call_args_list]
             self.assertEqual(
                 urls,
                 [
                     "https://example.blob.core.windows.net/container/drinking/frame.jpg",
                     "https://example.blob.core.windows.net/container/faucet/frame.jpg",
+                    "https://example.blob.core.windows.net/container/microwave/frame.jpg",
                 ],
             )
             self.assertFalse(image.exists())
 
             image.write_bytes(b"jpeg")
             error = HTTPError("https://example.invalid", 403, "forbidden", {}, None)
-            with patch.object(azure_blob, "urlopen", side_effect=[error, Response()]) as send:
+            with patch.object(azure_blob, "urlopen", side_effect=[Response(), Response(), error]) as send:
                 with self.assertRaises(azure_blob.AzureUploadError):
-                    uploader.upload_then_delete(image, ["drinking", "faucet"])
-                self.assertEqual(send.call_count, 2)
+                    uploader.upload_then_delete(image, ["drinking", "faucet", "microwave"])
+                self.assertEqual(send.call_count, 3)
             self.assertEqual(image.read_bytes(), b"jpeg")
 
     def test_strict_threshold_and_category_routing(self):
@@ -278,10 +339,11 @@ class DetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             uploader = FakeUploader()
             cases = [
-                (ai_analyzer.DetectionScores(0.5, 0.5), None),
-                (ai_analyzer.DetectionScores(0.6, 0.5), ["drinking"]),
-                (ai_analyzer.DetectionScores(None, 0.6), ["faucet"]),
-                (ai_analyzer.DetectionScores(0.6, 0.7), ["drinking", "faucet"]),
+                (ai_analyzer.DetectionScores(0.5, 0.5, 0.5), None),
+                (ai_analyzer.DetectionScores(0.6, 0.5, 0.5), ["drinking"]),
+                (ai_analyzer.DetectionScores(None, 0.6, 0.5), ["faucet"]),
+                (ai_analyzer.DetectionScores(0.1, 0.1, 0.6), ["microwave"]),
+                (ai_analyzer.DetectionScores(0.6, 0.7, 0.9), ["drinking", "faucet", "microwave"]),
             ]
             for scores, expected in cases:
                 with self.subTest(scores=scores):
@@ -302,7 +364,7 @@ class DetectionTests(unittest.TestCase):
             "OPENROUTER_API_KEY": "key",
             "QUESTION_MODE": "choice",
         }
-        with patch.dict(os.environ, env):
+        with patch.dict(os.environ, env, clear=True):
             providers = [
                 (cloudflare_clef, cloudflare_clef.CloudflareClefAnalyzer(), True),
                 (openrouter_decision, openrouter_decision.OpenRouterDecisionAnalyzer(), False),
@@ -312,11 +374,12 @@ class DetectionTests(unittest.TestCase):
                     answers = {
                         "activity": {
                             "type": "choice",
-                            "choice": "drinking",
+                            "choice": "microwave",
                             "probabilities": {
-                                "drinking": 0.82,
+                                "drinking": 0.05,
                                 "faucet": 0.11,
-                                "other": 0.07,
+                                "microwave": 0.82,
+                                "other": 0.02,
                             },
                         }
                     }
@@ -325,18 +388,81 @@ class DetectionTests(unittest.TestCase):
                         result = {"success": True, "result": result}
                     with patch.object(module, "urlopen", return_value=Response(result)) as send:
                         scores = analyzer.analyze_frame(b"jpeg", True)
-                    self.assertEqual(scores.drinking, 0.82)
+                    self.assertEqual(scores.drinking, 0.05)
                     self.assertEqual(scores.faucet, 0.11)
+                    self.assertEqual(scores.microwave, 0.82)
+                    self.assertEqual(scores.choice, "microwave")
                     request = json.loads(send.call_args.args[0].data)
                     self.assertEqual(set(request["questions"]), {"activity"})
                     question = request["questions"]["activity"]
                     self.assertEqual(question["type"], "choice")
                     self.assertEqual(
-                        set(question["criteria"]), {"drinking", "faucet", "other"}
+                        set(question["criteria"]), {"drinking", "faucet", "microwave", "other"}
                     )
                     self.assertEqual(
                         question["instructions"], ai_analyzer.CHOICE_INSTRUCTIONS
                     )
+
+    def test_microwave_detection_routes_to_azure_for_both_modes_and_providers(self):
+        env = {
+            "CLOUDFLARE_ACCOUNT_ID": "account",
+            "CLOUDFLARE_API_TOKEN": "token",
+            "OPENROUTER_API_KEY": "key",
+            "AZURE_BLOB_CONTAINER_URL": "https://example.blob.core.windows.net/container",
+            "AZURE_BLOB_SAS_TOKEN": "sp=cw&sig=fake",
+        }
+        cases = [
+            ("microwave", "choice", {
+                "activity": {
+                    "type": "choice",
+                    "choice": "microwave",
+                    "probabilities": {
+                        "drinking": 0.05, "faucet": 0.05,
+                        "microwave": 0.8, "other": 0.1,
+                    },
+                },
+            }),
+            ("microwave", "binary", {
+                "drinking": {"type": "noul", "noul": 0.1},
+                "faucet": {"type": "noul", "noul": 0.1},
+                "microwave": {"type": "noul", "noul": 0.8},
+            }),
+        ]
+        with patch.dict(os.environ, env, clear=True), tempfile.TemporaryDirectory() as directory:
+            providers = [
+                (cloudflare_clef, cloudflare_clef.CloudflareClefAnalyzer(), True),
+                (openrouter_decision, openrouter_decision.OpenRouterDecisionAnalyzer(), False),
+            ]
+            for category, mode, answers in cases:
+                for module, analyzer, wrapped in providers:
+                    with self.subTest(provider=module.__name__, mode=mode, category=category):
+                        result = {"answers": answers}
+                        if wrapped:
+                            result = {"success": True, "result": result}
+                        with patch.dict(os.environ, {"QUESTION_MODE": mode}), \
+                             patch.object(module, "urlopen", return_value=Response(result)) as send:
+                            scores = analyzer.analyze_frame(b"original image", True)
+                        questions = json.loads(send.call_args.args[0].data)["questions"]
+                        if mode == "choice":
+                            self.assertEqual(
+                                questions["activity"]["criteria"][category],
+                                ai_analyzer.CHOICE_CRITERIA[category],
+                            )
+                        else:
+                            self.assertEqual(
+                                questions[category]["instructions"],
+                                ai_analyzer.MICROWAVE_INSTRUCTIONS,
+                            )
+                        uploader = azure_blob.AzureBlobUploader()
+                        with patch.object(azure_blob, "urlopen", return_value=Response()) as upload:
+                            stream_camera.handle_detections(
+                                b"original image", scores, Path(directory), uploader
+                            )
+                        request = upload.call_args.args[0]
+                        upload.assert_called_once()
+                        self.assertIn(f"/container/{category}/", request.full_url)
+                        self.assertEqual(request.data, b"original image")
+                        self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_choice_probabilities_never_produce_two_categories(self):
         for drinking, faucet in ((0.51, 0.49), (0.49, 0.51), (0.34, 0.33), (0.9, 0.05)):
@@ -349,6 +475,7 @@ class DetectionTests(unittest.TestCase):
                             "probabilities": {
                                 "drinking": drinking,
                                 "faucet": faucet,
+                                "microwave": 0,
                                 "other": round(1 - drinking - faucet, 2),
                             },
                         }
@@ -361,23 +488,11 @@ class DetectionTests(unittest.TestCase):
                     for name, score in (
                         ("drinking", scores.drinking),
                         ("faucet", scores.faucet),
+                        ("microwave", scores.microwave),
                     )
                     if score is not None and score > stream_camera.POSITIVE_THRESHOLD
                 ]
                 self.assertLessEqual(len(categories), 1)
-
-    def test_choice_label_without_probabilities_uses_the_label(self):
-        cases = [
-            ("drinking", (1.0, 0.0)),
-            ("faucet", (0.0, 1.0)),
-            ("other", (0.0, 0.0)),
-        ]
-        for label, expected in cases:
-            with self.subTest(label=label):
-                scores = ai_analyzer.parse_scores(
-                    {"activity": {"type": "choice", "choice": label}}, True, "Provider"
-                )
-                self.assertEqual((scores.drinking, scores.faucet), expected)
 
     def test_invalid_choice_answers_are_errors(self):
         cases = [
@@ -385,6 +500,22 @@ class DetectionTests(unittest.TestCase):
             {"type": "choice", "choice": "washing"},
             {"type": "choice", "probabilities": {"drinking": 1.4, "faucet": 0.0}},
             {"type": "choice"},
+            {"type": "choice", "choice": "microwave"},
+            {"type": "choice", "choice": "microwave", "probabilities": {
+                "drinking": 0.1, "faucet": 0.1, "other": 0.8,
+            }},
+            {"type": "choice", "choice": "microwave", "probabilities": {
+                "drinking": 0.05, "faucet": 0.05, "other": 0.9,
+            }},
+            {"type": "choice", "choice": "microwave", "probabilities": {
+                "drinking": 0.9, "faucet": 0.9, "microwave": 0.0, "other": 0.0,
+            }},
+            {"type": "choice", "choice": "microwave", "probabilities": {
+                "drinking": 0.5004, "faucet": 0.0, "microwave": 0.5004, "other": 0.0,
+            }},
+            {"type": "choice", "choice": "microwave", "probabilities": {
+                "drinking": 0.1, "faucet": 0.1, "microwave": float("nan"), "other": 0.0,
+            }},
         ]
         for answer in cases:
             with self.subTest(answer=answer):
@@ -414,11 +545,11 @@ class DetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             uploader = FakeUploader()
             state = {}
-            both = ai_analyzer.DetectionScores(0.7, 0.8)
+            both = ai_analyzer.DetectionScores(0.7, 0.8, 0.95)
             stream_camera.handle_detections(
                 b"jpeg", both, Path(directory), uploader, 10.0, state
             )
-            self.assertEqual(uploader.calls, [["drinking", "faucet"]])
+            self.assertEqual(uploader.calls, [["drinking", "faucet", "microwave"]])
             stream_camera.handle_detections(
                 b"jpeg", both, Path(directory), uploader, 10.0, state
             )
@@ -457,6 +588,94 @@ class DetectionTests(unittest.TestCase):
                     ):
                         stream_camera.get_ai_request_interval()
 
+    def test_same_choice_cooldown_configuration(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(stream_camera.get_same_choice_cooldown(), 5.0)
+        for value, expected in (("0", 0.0), ("2.5", 2.5)):
+            with patch.dict(os.environ, {stream_camera.AI_SAME_CHOICE_COOLDOWN_ENV: value}):
+                self.assertEqual(stream_camera.get_same_choice_cooldown(), expected)
+        for value in ("-1", "", "abc", "nan", "inf"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {stream_camera.AI_SAME_CHOICE_COOLDOWN_ENV: value}):
+                    with self.assertRaisesRegex(ValueError, "AI_SAME_CHOICE_COOLDOWN_SECONDS"):
+                        stream_camera.get_same_choice_cooldown()
+        with patch.dict(os.environ, {"AI_SAME_CHOICE_COOLDOWN_SECONDS": "-1"}), \
+             patch.object(stream_camera, "load_dotenv"), \
+             patch.object(stream_camera, "create_analyzer") as create, \
+             patch("sys.stderr", new_callable=StringIO) as stderr:
+            self.assertEqual(stream_camera.run(), 2)
+            self.assertIn("AI_SAME_CHOICE_COOLDOWN_SECONDS", stderr.getvalue())
+            create.assert_not_called()
+
+    def test_request_cooldown_after_repeated_choice(self):
+        cases = [
+            (2, 5, ["other", "other", "drinking", "microwave", "microwave", "microwave"],
+             [0, 2, 8, 10, 12, 18]),
+            (2, 0, ["other", "other", "other"], [0, 2, 4]),
+            (2, 5, [None, None, None], [0, 2, 4]),
+            (2, 5, ["other", "error", "other", "other", "other"], [0, 2, 4, 6, 12]),
+            (10, 5, ["other", "other", "other"], [0, 10, 20]),
+        ]
+        for interval, cooldown, choices, expected in cases:
+            with self.subTest(interval=interval, cooldown=cooldown, choices=choices):
+                stream_camera.stop_event.clear()
+                self.addCleanup(stream_camera.stop_event.clear)
+                now = [0.0]
+                starts = []
+                process = MagicMock()
+                process.poll.return_value = None
+                process.returncode = 0
+                frames = MagicMock()
+                first_frame = [True]
+
+                def get_frame(**_kwargs):
+                    if first_frame[0]:
+                        first_frame[0] = False
+                    else:
+                        now[0] += 0.5
+                    return b"jpeg"
+
+                frames.get.side_effect = get_frame
+                frames.get_nowait.side_effect = stream_camera.queue.Empty
+                person_filter = MagicMock()
+                person_filter.detects_person.return_value = True
+                pending = iter(choices)
+
+                def analyze(*_args):
+                    starts.append(now[0])
+                    choice = next(pending)
+                    now[0] += 1
+                    if len(starts) == len(choices):
+                        stream_camera.stop_event.set()
+                    if choice == "error":
+                        raise ai_analyzer.AnalyzerError("test failure")
+                    return ai_analyzer.DetectionScores(0.1, 0.1, 0.1, choice)
+
+                def wait(seconds):
+                    self.fail("Request cooldown must not block YOLO processing")
+
+                settings = {
+                    "CAMERA_RTSP_URL": "rtsp://example",
+                    "AI_REQUEST_INTERVAL_SECONDS": str(interval),
+                    "AI_SAME_CHOICE_COOLDOWN_SECONDS": str(cooldown),
+                }
+                with patch.dict(os.environ, settings, clear=True), \
+                     patch.object(stream_camera, "load_dotenv"), \
+                     patch.object(stream_camera.shutil, "which", return_value="ffmpeg"), \
+                     patch.object(stream_camera, "create_analyzer"), \
+                     patch.object(stream_camera, "PersonFilter", return_value=person_filter), \
+                     patch.object(stream_camera, "AzureBlobUploader"), \
+                     patch.object(stream_camera.signal, "signal"), \
+                     patch.object(stream_camera.subprocess, "Popen", return_value=process), \
+                     patch.object(stream_camera.queue, "Queue", return_value=frames), \
+                     patch.object(stream_camera.threading, "Thread"), \
+                     patch.object(stream_camera.time, "monotonic", side_effect=lambda: now[0]), \
+                     patch.object(stream_camera.stop_event, "wait", side_effect=wait), \
+                     patch.object(stream_camera, "analyze_captured_frame", side_effect=analyze), \
+                     patch.object(stream_camera, "handle_detections"):
+                    self.assertEqual(stream_camera.run(), 0)
+                self.assertEqual(starts, expected)
+
     def test_upload_cooldown_configuration(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(stream_camera.get_upload_cooldown(), 0.0)
@@ -469,6 +688,64 @@ class DetectionTests(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(ValueError, "UPLOAD_COOLDOWN_SECONDS"):
                         stream_camera.get_upload_cooldown()
+
+    def test_no_person_and_reconnect_reset_choice_cooldown(self):
+        for reconnect in (False, True):
+            with self.subTest(reconnect=reconnect):
+                stream_camera.stop_event.clear()
+                self.addCleanup(stream_camera.stop_event.clear)
+                now = [0.0]
+                starts = []
+                frame_times = iter([0, 1, 7] if reconnect else [0, 1, 2, 3])
+                process = MagicMock()
+                process.returncode = 0
+                process.poll.side_effect = (
+                    [None, None, 0, None, None] if reconnect
+                    else [None, None, None, None, None]
+                )
+                frames = MagicMock()
+
+                def get_frame(**_kwargs):
+                    now[0] = next(frame_times)
+                    return b"jpeg"
+
+                frames.get.side_effect = get_frame
+                frames.get_nowait.side_effect = stream_camera.queue.Empty
+                person_filter = MagicMock()
+                person_filter.detects_person.side_effect = (
+                    [True, True, True] if reconnect else [True, True, False, True]
+                )
+
+                def analyze(*_args):
+                    starts.append(now[0])
+                    if len(starts) == 3:
+                        stream_camera.stop_event.set()
+                    return ai_analyzer.DetectionScores(0.1, 0.1, 0.1, "other")
+
+                settings = {
+                    "CAMERA_RTSP_URL": "rtsp://example",
+                    "AI_REQUEST_INTERVAL_SECONDS": "1",
+                    "AI_SAME_CHOICE_COOLDOWN_SECONDS": "5",
+                }
+                with patch.dict(os.environ, settings, clear=True), \
+                     patch.object(stream_camera, "load_dotenv"), \
+                     patch.object(stream_camera.shutil, "which", return_value="ffmpeg"), \
+                     patch.object(stream_camera, "create_analyzer"), \
+                     patch.object(stream_camera, "PersonFilter", return_value=person_filter), \
+                     patch.object(stream_camera, "AzureBlobUploader"), \
+                     patch.object(stream_camera.signal, "signal"), \
+                     patch.object(stream_camera.subprocess, "Popen", return_value=process), \
+                     patch.object(stream_camera.queue, "Queue", return_value=frames), \
+                     patch.object(stream_camera.threading, "Thread"), \
+                     patch.object(stream_camera.time, "monotonic", side_effect=lambda: now[0]), \
+                     patch.object(stream_camera.stop_event, "wait", return_value=False), \
+                     patch.object(stream_camera, "analyze_captured_frame", side_effect=analyze), \
+                     patch.object(stream_camera, "handle_detections"), \
+                     patch("sys.stdout", new_callable=StringIO) as output:
+                    self.assertEqual(stream_camera.run(), 0)
+                self.assertEqual(starts, [0, 1, 7] if reconnect else [0, 1, 3])
+                self.assertEqual(output.getvalue().count("Repeated choice 'other'"), 1)
+                self.assertEqual(person_filter.detects_person.call_count, 3 if reconnect else 4)
 
 
 if __name__ == "__main__":

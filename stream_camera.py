@@ -25,8 +25,10 @@ DEFAULT_AI_IMAGE_MAX_SIZE = (1280, 720)
 UPLOAD_COOLDOWN_ENV = "UPLOAD_COOLDOWN_SECONDS"
 CAPTURE_FPS_ENV = "CAPTURE_FPS"
 AI_REQUEST_INTERVAL_ENV = "AI_REQUEST_INTERVAL_SECONDS"
+AI_SAME_CHOICE_COOLDOWN_ENV = "AI_SAME_CHOICE_COOLDOWN_SECONDS"
 DEFAULT_CAPTURE_FPS = 2
 DEFAULT_AI_REQUEST_INTERVAL_SECONDS = 2.0
+DEFAULT_AI_SAME_CHOICE_COOLDOWN_SECONDS = 5.0
 stop_event = threading.Event()
 
 
@@ -111,6 +113,23 @@ def get_upload_cooldown() -> float:
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError(
             f"{UPLOAD_COOLDOWN_ENV} must be a non-negative number of seconds."
+        )
+    return seconds
+
+
+def get_same_choice_cooldown() -> float:
+    raw = os.environ.get(
+        AI_SAME_CHOICE_COOLDOWN_ENV, str(DEFAULT_AI_SAME_CHOICE_COOLDOWN_SECONDS)
+    ).strip()
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"{AI_SAME_CHOICE_COOLDOWN_ENV} must be a non-negative number of seconds."
+        ) from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(
+            f"{AI_SAME_CHOICE_COOLDOWN_ENV} must be a non-negative number of seconds."
         )
     return seconds
 
@@ -200,11 +219,14 @@ def handle_detections(
     if scores.drinking is not None:
         print(f"Drinking score: {scores.drinking:.3f}", flush=True)
     print(f"Faucet score: {scores.faucet:.3f}", flush=True)
+    print(f"Microwave score: {scores.microwave:.3f}", flush=True)
     categories = []
     if scores.drinking is not None and scores.drinking > POSITIVE_THRESHOLD:
         categories.append("drinking")
     if scores.faucet > POSITIVE_THRESHOLD:
         categories.append("faucet")
+    if scores.microwave > POSITIVE_THRESHOLD:
+        categories.append("microwave")
     if not categories:
         return
 
@@ -273,6 +295,7 @@ def run() -> int:
     try:
         capture_fps = get_capture_fps()
         ai_request_interval = get_ai_request_interval()
+        same_choice_cooldown = get_same_choice_cooldown()
     except ValueError as error:
         print(f"Invalid capture configuration: {error}", file=sys.stderr)
         return 2
@@ -320,10 +343,11 @@ def run() -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     print(
-        f"Frames sampled at {capture_fps} fps; YOLO gates drinking and "
-        f"faucet detection. AI image maximum is {ai_image_max_size[0]}x"
-        f"{ai_image_max_size[1]}. Hosted AI requests "
+        f"Frames sampled at {capture_fps} fps; YOLO gates drinking, faucet, "
+        f"and microwave detection. AI image maximum is {ai_image_max_size[0]}x"
+        f"{ai_image_max_size[1]}. AI requests "
         f"are spaced at least {ai_request_interval:g} seconds apart. "
+        f"Repeated choice cooldown: {same_choice_cooldown:g} seconds. "
         + (
             f"Repeat uploads per category are suppressed for "
             f"{upload_cooldown:g} seconds. "
@@ -336,6 +360,8 @@ def run() -> int:
 
     upload_state: dict[str, float] = {}
     next_request_at = 0.0
+    choice_cooldown_until = 0.0
+    previous_choice: Optional[str] = None
     while not stop_event.is_set():
         command = [
             ffmpeg,
@@ -379,16 +405,14 @@ def run() -> int:
         )
         frame_thread.start()
         log_thread.start()
+        previous_choice = None
+        choice_cooldown_until = 0.0
 
         while not stop_event.is_set() and process.poll() is None:
             try:
                 image = frames.get(timeout=0.5)
             except queue.Empty:
                 continue
-
-            delay = next_request_at - time.monotonic()
-            if delay > 0 and stop_event.wait(delay):
-                break
 
             while True:
                 try:
@@ -406,16 +430,34 @@ def run() -> int:
                 )
                 continue
             if not person_present:
+                previous_choice = None
+                choice_cooldown_until = 0.0
                 continue
 
-            next_request_at = time.monotonic() + ai_request_interval
+            now = time.monotonic()
+            if now < max(next_request_at, choice_cooldown_until):
+                continue
+            next_request_at = now + ai_request_interval
             try:
                 scores = analyze_captured_frame(
                     analyzer, image, person_present, ai_image_max_size
                 )
             except AnalyzerError as error:
+                previous_choice = None
                 print(f"Frame analysis failed: {error}", file=sys.stderr, flush=True)
             else:
+                if (
+                    scores.choice is not None
+                    and scores.choice == previous_choice
+                    and same_choice_cooldown > 0
+                ):
+                    choice_cooldown_until = time.monotonic() + same_choice_cooldown
+                    print(
+                        f"Repeated choice '{scores.choice}'; pausing AI requests "
+                        f"for at least {same_choice_cooldown:g} seconds.",
+                        flush=True,
+                    )
+                previous_choice = scores.choice
                 handle_detections(
                     image,
                     scores,

@@ -11,12 +11,12 @@ class OpenRouterDecisionAnalyzer:
     def __init__(self) -> None:
         self.api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
         self.model = os.environ.get(
-            "OPENROUTER_MODEL", "liquid/d1.1"
+            "MODEL", "liquid/d1.1"
         ).strip()
         if not self.api_key or self.api_key.startswith("REPLACE_"):
             raise AnalyzerError("Set OPENROUTER_API_KEY in .env.")
         if not self.model:
-            raise AnalyzerError("OPENROUTER_MODEL cannot be empty.")
+            raise AnalyzerError("MODEL cannot be empty.")
 
     def analyze_frame(self, image: bytes, person_present: bool) -> DetectionScores:
         image_data = base64.b64encode(image).decode("ascii")

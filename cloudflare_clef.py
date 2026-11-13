@@ -12,15 +12,20 @@ class CloudflareClefAnalyzer:
     def __init__(self) -> None:
         self.account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
         self.api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+        self.model = os.environ.get("MODEL", "clef").strip()
 
         if not self.account_id or self.account_id.startswith("REPLACE_"):
             raise AnalyzerError("Set CLOUDFLARE_ACCOUNT_ID in .env.")
         if not self.api_token or self.api_token.startswith("REPLACE_"):
             raise AnalyzerError("Set CLOUDFLARE_API_TOKEN in .env.")
+        if self.model not in ("clef", "clef-flash"):
+            raise AnalyzerError(
+                "For AI_PROVIDER=cloudflare, MODEL must be 'clef' or 'clef-flash'."
+            )
 
     def analyze_frame(self, image: bytes, person_present: bool) -> DetectionScores:
         payload = {
-            "model": "clef",
+            "model": self.model,
             "state": (
                 "Inspect this camera image for the situations in the questions."
             ),
@@ -34,7 +39,7 @@ class CloudflareClefAnalyzer:
         }
         endpoint = (
             "https://api.cloudflare.com/client/v4/accounts/"
-            f"{quote(self.account_id, safe='')}/ai/run/@cf/cloudflare/clef"
+            f"{quote(self.account_id, safe='')}/ai/run/@cf/cloudflare/{self.model}"
         )
         request = Request(
             endpoint,

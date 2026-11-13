@@ -15,6 +15,7 @@ class AzureUploadError(Exception):
 CATEGORY_PREFIXES = {
     "drinking": "drinking",
     "faucet": "faucet",
+    "microwave": "microwave",
 }
 
 

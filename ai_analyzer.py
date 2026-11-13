@@ -29,13 +29,18 @@ FAUCET_INSTRUCTIONS = (
     "qualify. If there is no visible water flow or no clear interaction, answer no."
 )
 
+MICROWAVE_INSTRUCTIONS = (
+    "Is a person visibly opening or interacting with an open microwave oven door "
+    "in this image? Answer yes only when the microwave door is visibly open and "
+    "the person is interacting with that microwave, for example holding the door "
+    "or putting food into or taking food out of it. A person merely nearby, an "
+    "unattended open microwave, or a hand near a closed microwave does not qualify. "
+    "Do not infer that the door is open from a lit display, appliance presence, "
+    "or a person's position. If the open door or interaction is unclear, answer no."
+)
 
-# A pantry camera sees a person who is either drinking or using the faucet, so one
-# exclusive question replaces the two independent ones. The choice answer carries a
-# probability per option and those probabilities sum to one, so drinking and faucet
-# can never both pass POSITIVE_THRESHOLD for the same frame.
 CHOICE_QUESTION = "activity"
-CHOICE_OPTIONS = ("drinking", "faucet", "other")
+CHOICE_OPTIONS = ("drinking", "faucet", "microwave", "other")
 
 CHOICE_INSTRUCTIONS = (
     "What is the person in this image most likely doing? Choose drinking when a "
@@ -46,9 +51,14 @@ CHOICE_INSTRUCTIONS = (
     "the control or hands under the running water; a person merely nearby, an "
     "unattended running tap, a wet sink, steam, standing water, or a kettle or "
     "water boiler alone does not qualify, and do not infer water flow from a hand "
-    "on the control or the handle position. Choose other for anything else, "
+    "on the control or the handle position. "
+    "Choose microwave only when its door is visibly open and a person is "
+    "interacting with that microwave, such as holding the door or placing or "
+    "removing food; a person merely nearby or an unattended open microwave "
+    "does not qualify. "
+    "Choose other for anything else, "
     "including eating, smoking, carrying a drink away from the mouth, or standing "
-    "or walking without either cue."
+    "or walking without any of these cues."
 )
 
 CHOICE_CRITERIA = {
@@ -60,8 +70,13 @@ CHOICE_CRITERIA = {
         "Visible water flowing from a tap while the person touches the control or "
         "holds their hands under that flow."
     ),
+    "microwave": (
+        "A person visibly interacting with a microwave whose door is open, "
+        "such as holding the door or placing or removing food."
+    ),
     "other": (
-        "No plausible drinking cue and no visible running-water interaction: "
+        "No plausible drinking cue, running-water interaction, or person "
+        "interacting with an open microwave: "
         "walking, standing, eating, smoking, working, a dry or unattended tap, or "
         "a kettle or water boiler on its own."
     ),
@@ -85,6 +100,8 @@ def get_question_mode() -> str:
 class DetectionScores:
     drinking: Optional[float]
     faucet: float
+    microwave: float
+    choice: Optional[str] = None
 
 
 def build_questions(person_present: bool) -> dict:
@@ -107,6 +124,10 @@ def build_questions(person_present: bool) -> dict:
             "type": "noul",
             "instructions": DRINKING_INSTRUCTIONS,
         },
+        "microwave": {
+            "type": "noul",
+            "instructions": MICROWAVE_INSTRUCTIONS,
+        },
     }
 
 
@@ -120,26 +141,28 @@ def validate_probability(value: object, label: str, provider: str) -> float:
     return float(value)
 
 
-def parse_choice_answer(answer: object, provider: str) -> tuple[float, float]:
+def parse_choice_answer(answer: object, provider: str) -> tuple[float, float, float, str]:
     if not isinstance(answer, dict) or answer.get("type") != "choice":
         raise AnalyzerError(f"{provider} response has no choice answer.")
 
-    probabilities = answer.get("probabilities")
-    if isinstance(probabilities, dict) and probabilities:
-        scores = []
-        for name in ("drinking", "faucet"):
-            if name not in probabilities:
-                scores.append(0.0)
-                continue
-            scores.append(
-                validate_probability(probabilities[name], f"{name} choice", provider)
-            )
-        return scores[0], scores[1]
-
     label = answer.get("choice")
-    if label not in CHOICE_OPTIONS:
+    if not isinstance(label, str) or label not in CHOICE_OPTIONS:
         raise AnalyzerError(f"{provider} returned an unknown choice: {label!r}.")
-    return (1.0 if label == "drinking" else 0.0, 1.0 if label == "faucet" else 0.0)
+    probabilities = answer.get("probabilities")
+    if not isinstance(probabilities, dict) or set(probabilities) != set(CHOICE_OPTIONS):
+        raise AnalyzerError(f"{provider} response has incomplete choice probabilities.")
+    scores = {
+        name: validate_probability(probabilities[name], f"{name} choice", provider)
+        for name in CHOICE_OPTIONS
+    }
+    if abs(sum(scores.values()) - 1.0) > 0.001:
+        raise AnalyzerError(f"{provider} choice probabilities do not sum to 1.")
+    if sum(score > 0.5 for score in scores.values()) > 1:
+        raise AnalyzerError(f"{provider} choice probabilities are inconsistent.")
+    return (
+        scores["drinking"], scores["faucet"],
+        scores["microwave"], label,
+    )
 
 
 def parse_scores(answers: object, person_present: bool, provider: str) -> DetectionScores:
@@ -147,10 +170,14 @@ def parse_scores(answers: object, person_present: bool, provider: str) -> Detect
         raise AnalyzerError(f"{provider} response has no answers object.")
 
     if CHOICE_QUESTION in answers:
-        drinking, faucet = parse_choice_answer(answers[CHOICE_QUESTION], provider)
+        drinking, faucet, microwave, choice = parse_choice_answer(
+            answers[CHOICE_QUESTION], provider
+        )
         return DetectionScores(
             drinking=drinking if person_present else None,
             faucet=faucet,
+            microwave=microwave,
+            choice=choice,
         )
 
     def probability(name: str) -> float:
@@ -162,6 +189,7 @@ def parse_scores(answers: object, person_present: bool, provider: str) -> Detect
     return DetectionScores(
         drinking=probability("drinking") if person_present else None,
         faucet=probability("faucet"),
+        microwave=probability("microwave"),
     )
 
 
@@ -180,8 +208,12 @@ def create_analyzer() -> FrameAnalyzer:
         from openrouter_decision import OpenRouterDecisionAnalyzer
 
         return OpenRouterDecisionAnalyzer()
+    if provider == "llama_cpp":
+        from llama_cpp_decision import LlamaCppDecisionAnalyzer
+
+        return LlamaCppDecisionAnalyzer()
 
     raise AnalyzerError(
         f"Unsupported AI_PROVIDER: {provider or '(empty)'}. "
-        "Choose 'cloudflare' or 'openrouter'."
+        "Choose 'cloudflare', 'openrouter', or 'llama_cpp'."
     )
